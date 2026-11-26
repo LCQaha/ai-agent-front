@@ -13,4 +13,15 @@ export const APP_REGISTRY = Object.freeze([
       Object.freeze({ label: '聊聊一段关系', prompt: '我想理清一段关系，可以陪我聊聊吗？' }),
     ]),
   }),
+  Object.freeze({
+    id: 'firstapp',
+    name: 'FirstApp',
+    description: '记住同一会话里的提问和回答，可随时切换回复方式。',
+    endpoint: '/api/ai/first-app',
+    eventStreamEndpoint: '/api/ai/first-app/event-stream',
+    suggestions: Object.freeze([
+      Object.freeze({ label: '记下一个代号', prompt: '请记住，我的代号是青松。' }),
+      Object.freeze({ label: '接着上次聊', prompt: '我刚才告诉你的代号是什么？' }),
+    ]),
+  }),
 ]);

@@ -1,10 +1,11 @@
 import { effectScope } from 'vue';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { APP_REGISTRY } from '../src/config/apps.js';
-import { ChatRequestError, sendCompleteRequest, sendStreamRequest } from '../src/api/chat.js';
+import { ChatRequestError, sendCompleteRequest, sendEventStreamRequest, sendStreamRequest } from '../src/api/chat.js';
 import { useChat } from '../src/composables/useChat.js';
 
 const app = APP_REGISTRY[0];
+const firstApp = APP_REGISTRY.find(item => item.id === 'firstapp');
 const answer = (conversationId = 'conversation-a') => ({ conversationId, answer: '**模拟回复**' });
 const response = (body, status = 200) => ({ ok: status >= 200 && status < 300, status, json: async () => body });
 const deferred = () => {
@@ -25,9 +26,11 @@ afterEach(() => {
 });
 
 describe('complete response API', () => {
-  it('registers only the available LoveApp endpoint', () => {
-    expect(APP_REGISTRY).toHaveLength(1);
+  it('registers the LoveApp and FirstApp endpoints', () => {
     expect(app).toMatchObject({ id: 'loveapp', endpoint: '/api/ai/love/v1', streamEndpoint: null });
+    expect(APP_REGISTRY.find(item => item.id === 'firstapp')).toMatchObject({
+      endpoint: '/api/ai/first-app', eventStreamEndpoint: '/api/ai/first-app/event-stream',
+    });
   });
 
   it('omits the first conversation ID and sends the returned ID on continuation', async () => {
@@ -54,6 +57,22 @@ describe('complete response API', () => {
     });
     expect(fetchImpl).toHaveBeenCalledTimes(1);
     expect(readError).not.toHaveBeenCalled();
+  });
+
+  it('retains an optional server-supplied expiry date', async () => {
+    const expiresAt = '2026-11-26T16:20:30.123456Z';
+    for (const body of [answer(), { ...answer(), expiresAt }]) {
+      await expect(sendCompleteRequest({ app: firstApp, message: '问题', fetchImpl: async () => response(body) }))
+        .resolves.toEqual(body);
+    }
+  });
+
+  it.each([sendCompleteRequest, sendEventStreamRequest])('maps FirstApp HTTP 410 to session_expired', async send => {
+    const options = { app: firstApp, message: '续聊', conversationId: 'old-id',
+      fetchImpl: async () => response({ detail: 'internal-details' }, 410) };
+    await expect(send(options)).rejects.toMatchObject({
+      code: 'session_expired', message: expect.not.stringContaining('internal-details'),
+    });
   });
 
   it.each([
@@ -109,6 +128,86 @@ describe('complete response API', () => {
     await expect(sendCompleteRequest({ app, message: '问题', signal: controller.signal, fetchImpl }))
       .rejects.toMatchObject({ code: 'aborted' });
     expect(fetchImpl).not.toHaveBeenCalled();
+  });
+});
+
+describe('SSE failure events', () => {
+  function failedTurn(error) {
+    const body = `event: turn.finished\ndata: ${JSON.stringify({ status: 'failed', error })}\n\n`;
+    return sendEventStreamRequest({
+      app: APP_REGISTRY.find(item => item.id === 'firstapp'),
+      message: '问题',
+      fetchImpl: async () => new Response(body, { headers: { 'Content-Type': 'text/event-stream' } }),
+    });
+  }
+
+  it('passes the public reason from a failed turn to the caller', async () => {
+    const message = '连接模型服务时安全连接中断，请稍后重试。';
+    await expect(failedTurn({ code: 'upstream_tls', message })).rejects.toMatchObject({
+      code: 'generation-failed', message,
+    });
+  });
+
+  it('maps a failed session_expired event to the same code as HTTP 410', async () => {
+    await expect(failedTurn({ code: 'session_expired', message: 'internal-details' })).rejects.toMatchObject({
+      code: 'session_expired', message: expect.not.stringContaining('internal-details'),
+    });
+  });
+
+  it.each([undefined, null, 'raw error', { message: 'missing code' }, { code: 'unknown', message: ' ' }])(
+    'keeps the legacy failure message for an absent or malformed reason: %j', async error => {
+      await expect(failedTurn(error)).rejects.toMatchObject({
+        code: 'generation-failed', message: '后端报告本轮生成失败。',
+      });
+    },
+  );
+});
+
+describe('SSE waiting time', () => {
+  function openStream() {
+    vi.useFakeTimers();
+    let source;
+    const stream = new ReadableStream({ start(controller) { source = controller; } });
+    const onText = vi.fn();
+    const request = sendEventStreamRequest({
+      app: firstApp, message: '问题', timeoutMs: 100, idleTimeoutMs: 60, onText,
+      fetchImpl: async () => new Response(stream, { headers: { 'Content-Type': 'text/event-stream' } }),
+    });
+    const send = (event, data) => source.enqueue(
+      new TextEncoder().encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`),
+    );
+    return { request, send, onText };
+  }
+
+  it('waits for the first event even if the response headers have arrived', async () => {
+    const { request } = openStream();
+    const timeout = expect(request).rejects.toMatchObject({ code: 'timeout', message: expect.stringContaining('首个事件') });
+    await vi.advanceTimersByTimeAsync(100);
+    await timeout;
+  });
+
+  it('continues beyond the initial timeout while complete events keep arriving', async () => {
+    const { request, send, onText } = openStream();
+    const finished = expect(request).resolves.toBeUndefined();
+    await vi.advanceTimersByTimeAsync(90);
+    send('turn.started', {});
+    await vi.advanceTimersByTimeAsync(50);
+    send('generation.started', {});
+    await vi.advanceTimersByTimeAsync(50);
+    send('answer.delta', { text: '回答' });
+    await vi.advanceTimersByTimeAsync(50);
+    send('turn.finished', { status: 'completed' });
+    await finished;
+    expect(onText).toHaveBeenCalledWith('回答');
+  });
+
+  it('times out if no event follows the latest delta', async () => {
+    const { request, send, onText } = openStream();
+    const timeout = expect(request).rejects.toMatchObject({ code: 'timeout', message: expect.stringContaining('下一个事件') });
+    send('answer.delta', { text: '部分回答' });
+    await vi.advanceTimersByTimeAsync(60);
+    await timeout;
+    expect(onText).toHaveBeenCalledWith('部分回答');
   });
 });
 

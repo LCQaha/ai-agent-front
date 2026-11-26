@@ -50,7 +50,8 @@ select { display: block; width: 100%; padding: 10px 12px; color: var(--ink); bor
 .session-note p { margin: 0; }
 .note-mark { color: #81977d; font-size: 19px; }
 .chat-panel { display: flex; flex-direction: column; min-width: 0; height: min(740px, calc(100dvh - 215px)); min-height: 580px; border: 1px solid var(--line); border-radius: 18px; background: #fffefa; overflow: hidden; box-shadow: 0 8px 30px #243b2c04; }
-.chat-header { flex-shrink: 0; padding: 18px 24px; display: flex; justify-content: space-between; gap: 12px; align-items: center; border-bottom: 1px solid #e9ece4; }
+.chat-header { position: relative; flex-shrink: 0; flex-wrap: wrap; padding: 18px 24px; display: flex; justify-content: space-between; gap: 12px; align-items: center; border-bottom: 1px solid #e9ece4; }
+.chat-header-actions { display: flex; align-items: center; gap: 8px; margin-left: auto; }
 .chat-heading { display: flex; gap: 11px; align-items: center; min-width: 0; }
 .app-avatar { background: #ede7df; color: #8d6b5b; width: 36px; height: 36px; display: grid; place-items: center; flex-shrink: 0; border-radius: 11px; font-family: Georgia, serif; font-size: 20px; font-style: italic; }
 .chat-heading h2 { font-size: 15px; margin: 0; font-weight: 650; }
@@ -70,6 +71,8 @@ select { display: block; width: 100%; padding: 10px 12px; color: var(--ink); bor
 .suggestions button:hover:not(:disabled) { background: #edf3e9; border-color: #b6c6ac; }
 .messages { height: 100%; overflow-y: auto; overscroll-behavior: contain; padding: 24px; scrollbar-width: thin; scrollbar-color: #ccd5c5 transparent; }
 .message { display: flex; gap: 11px; align-items: flex-start; margin-bottom: 24px; }
+.session-divider { display: flex; align-items: center; gap: 12px; margin: 8px 0 24px; color: var(--muted); font-size: 12px; }
+.session-divider::before, .session-divider::after { content: ''; flex: 1; border-top: 1px solid var(--line); }
 .message-avatar { display: grid; place-items: center; flex: 0 0 30px; height: 30px; background: #eee8e0; border-radius: 9px; color: #856952; font-size: 11px; font-weight: 600; }
 .message-content { min-width: 0; max-width: min(88%, 680px); }
 .message-role { font-size: 10px; color: var(--muted); margin-bottom: 5px; }

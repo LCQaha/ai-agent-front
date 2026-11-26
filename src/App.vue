@@ -2,22 +2,28 @@
 import { computed, nextTick, ref, watch } from 'vue';
 import MarkdownMessage from './components/MarkdownMessage.vue';
 import BaseChatBenchmark from './components/BaseChatBenchmark.vue';
+import ChatErrorNotice from './components/ChatErrorNotice.vue';
 import { APP_REGISTRY } from './config/apps.js';
 import { useChat } from './composables/useChat.js';
 
 const {
-  activeApp, activeAppId, session, pending, pendingMessage,
+  activeApp, activeAppId, session, pending, pendingMessage, streamedAnswer, streamStage,
   setDraft, selectApp, newConversation, send, restoreFailedDraft,
 } = useChat();
 const workspaceView = ref('chat');
+const delivery = ref('complete');
 const messageInput = ref(null);
 const messageList = ref(null);
 const composing = ref(false);
 const conversationLabel = computed(() => session.value.conversationId
   ? `会话 ${session.value.conversationId.slice(0, 8)}` : '新会话 · 尚未开始');
 const requestStatus = computed(() => {
+  if (pending.value && streamedAnswer.value) return '正在接收回答…';
+  if (streamStage.value === 'generation.started') return '正在生成回答…';
+  if (streamStage.value === 'turn.started') return '本轮已开始…';
   if (pending.value) return '正在等待回复，你可以先写下一条消息。';
-  if (session.value.error) return '发送未完成，请查看提示。';
+  if (session.value.error) return activeAppId.value === 'firstapp' ? '消息已保留，可以编辑后再发送。' : '发送未完成，请查看提示。';
+  if (session.value.outcome === 'expired') return '下次发送将开启新会话。';
   if (session.value.outcome === 'success') return '已收到回复，可以继续聊。';
   return '准备好了，随时开始。';
 });
@@ -27,7 +33,7 @@ function focusInput() { nextTick(() => messageInput.value?.focus()); }
 function submit() {
   if (composing.value || pending.value || !session.value.draft.trim()) return;
   // send() 在等待 HTTP 响应前清空当前草稿；输入框仍可写下一条。
-  void send();
+  void send({ delivery: activeApp.value.eventStreamEndpoint ? delivery.value : 'complete' });
   focusInput();
 }
 
@@ -43,7 +49,7 @@ function useSuggestion(prompt) { setDraft(prompt); focusInput(); }
 function startNewConversation() { if (newConversation()) focusInput(); }
 function recoverDraft() { if (restoreFailedDraft()) focusInput(); }
 
-watch([() => session.value.messages.length, pending, activeAppId], async () => {
+watch([() => session.value.messages.length, pending, streamedAnswer, activeAppId], async () => {
   await nextTick();
   if (messageList.value) messageList.value.scrollTop = messageList.value.scrollHeight;
 });
@@ -81,16 +87,26 @@ watch([() => session.value.messages.length, pending, activeAppId], async () => {
             <option v-for="app in APP_REGISTRY" :key="app.id" :value="app.id">{{ app.name }}</option>
           </select>
           <div class="app-summary">
-            <span class="heart-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M20.8 4.6a5.5 5.5 0 0 0-7.8 0L12 5.7l-1.1-1.1a5.5 5.5 0 0 0-7.8 7.8L12 21l8.8-8.6a5.5 5.5 0 0 0 0-7.8Z"/></svg></span>
-            <h2>关系里的小事，<br>都可以慢慢说。</h2>
+            <span v-if="activeAppId === 'loveapp'" class="heart-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M20.8 4.6a5.5 5.5 0 0 0-7.8 0L12 5.7l-1.1-1.1a5.5 5.5 0 0 0-7.8 7.8L12 21l8.8-8.6a5.5 5.5 0 0 0 0-7.8Z"/></svg></span>
+            <h2 v-if="activeAppId === 'loveapp'">关系里的小事，<br>都可以慢慢说。</h2>
+            <h2 v-else>{{ activeApp.name }}</h2>
             <p id="app-description">{{ activeApp.description }}</p>
             <span class="feature-tag"><span aria-hidden="true"></span> 支持多轮对话</span>
           </div>
           <div class="delivery-settings">
-            <p class="delivery-label">回复方式</p>
-            <button id="stream-toggle" class="secondary-button stream-toggle" type="button"
-                    aria-describedby="delivery-hint" disabled>开启流式输出</button>
-            <p id="delivery-hint" class="field-hint">流式输出暂未开放，当前显示完整回复。</p>
+            <template v-if="activeApp.eventStreamEndpoint">
+              <label for="delivery-select">回复方式</label>
+              <select id="delivery-select" v-model="delivery" :disabled="pending">
+                <option value="complete">完整回复</option>
+                <option value="events">事件流（SSE）</option>
+              </select>
+            </template>
+            <template v-else>
+              <p class="delivery-label">回复方式</p>
+              <button id="stream-toggle" class="secondary-button stream-toggle" type="button"
+                      aria-describedby="delivery-hint" disabled>开启流式输出</button>
+              <p id="delivery-hint" class="field-hint">流式输出暂未开放，当前显示完整回复。</p>
+            </template>
           </div>
           <div class="session-note"><span class="note-mark" aria-hidden="true">↳</span>
             <p>每次新建会话，都从新的话题开始。刷新页面也会开启新会话。</p>
@@ -105,45 +121,59 @@ watch([() => session.value.messages.length, pending, activeAppId], async () => {
                 <p id="conversation-label" :title="session.conversationId || ''">{{ conversationLabel }}</p>
               </div>
             </div>
-            <button id="new-chat" class="secondary-button" type="button" :disabled="pending" @click="startNewConversation">＋ 新建会话</button>
+            <div class="chat-header-actions">
+              <ChatErrorNotice v-if="activeAppId === 'firstapp' && workspaceView === 'chat'" :session="session" />
+              <button id="new-chat" class="secondary-button" type="button" :disabled="pending" @click="startNewConversation">＋ 新建会话</button>
+            </div>
           </div>
 
           <div class="chat-body">
             <div v-if="!session.messages.length && !pending" class="empty-state">
-              <div class="welcome-symbol" aria-hidden="true"><svg viewBox="0 0 48 48"><path d="M37 28a15 15 0 1 0-25 7l-2 8 9-3a15 15 0 0 0 18-12Z"/><path d="M17 21c0-5 7-5 7 0 0-5 7-5 7 0 0 4-7 8-7 8s-7-4-7-8Z"/></svg></div>
-              <p class="welcome-eyebrow">留一点时间，聊聊你自己</p>
+              <div v-if="activeAppId === 'loveapp'" class="welcome-symbol" aria-hidden="true"><svg viewBox="0 0 48 48"><path d="M37 28a15 15 0 1 0-25 7l-2 8 9-3a15 15 0 0 0 18-12Z"/><path d="M17 21c0-5 7-5 7 0 0-5 7-5 7 0 0 4-7 8-7 8s-7-4-7-8Z"/></svg></div>
+              <p v-if="activeAppId === 'loveapp'" class="welcome-eyebrow">留一点时间，聊聊你自己</p>
               <h2>今天，想从哪里说起？</h2>
-              <p class="welcome-description">不必组织好所有语言。一个小困惑，也可以是开始。</p>
+              <p class="welcome-description">{{ activeAppId === 'loveapp'
+                ? '不必组织好所有语言。一个小困惑，也可以是开始。'
+                : '先告诉我一个代号，再问我是否记得。' }}</p>
               <div class="suggestions" aria-label="话题建议">
                 <button v-for="suggestion in activeApp.suggestions" :key="suggestion.label" type="button"
                         @click="useSuggestion(suggestion.prompt)">{{ suggestion.label }} <span aria-hidden="true">↗</span></button>
               </div>
             </div>
             <div ref="messageList" id="messages" class="messages" role="log" aria-live="polite" aria-relevant="additions" aria-label="对话记录">
-              <article v-for="(message, index) in session.messages" :key="`${activeAppId}-${index}`"
-                       class="message" :class="`message--${message.role}`">
-                <span class="message-avatar" aria-hidden="true">{{ message.role === 'user' ? '你' : activeApp.name.charAt(0) }}</span>
-                <div class="message-content">
-                  <div class="message-role">{{ message.role === 'user' ? '你' : activeApp.name }}</div>
-                  <p v-if="message.role === 'user'" class="message-text">{{ message.content }}</p>
-                  <MarkdownMessage v-else class="message-text" :content="message.content" />
+              <template v-for="(message, index) in session.messages" :key="`${activeAppId}-${index}`">
+                <div v-if="message.type === 'session-expired'" class="session-divider" role="separator" aria-label="上一段会话已过期">
+                  上一段会话已过期
                 </div>
-              </article>
+                <article v-else class="message" :class="`message--${message.role}`">
+                  <span class="message-avatar" aria-hidden="true">{{ message.role === 'user' ? '你' : activeApp.name.charAt(0) }}</span>
+                  <div class="message-content">
+                    <div class="message-role">{{ message.role === 'user' ? '你' : activeApp.name }}</div>
+                    <p v-if="message.role === 'user'" class="message-text">{{ message.content }}</p>
+                    <MarkdownMessage v-else class="message-text" :content="message.content" />
+                    <small v-if="message.interrupted">回答已中断</small>
+                  </div>
+                </article>
+              </template>
               <template v-if="pending">
                 <article class="message message--user">
                   <span class="message-avatar" aria-hidden="true">你</span>
                   <div class="message-content"><div class="message-role">你</div><p class="message-text">{{ pendingMessage }}</p></div>
                 </article>
-                <article class="message message--pending">
+                <article class="message" :class="streamedAnswer ? 'message--assistant' : 'message--pending'">
                   <span class="message-avatar" aria-hidden="true">{{ activeApp.name.charAt(0) }}</span>
-                  <div class="message-content"><div class="message-role">{{ activeApp.name }}</div><p class="message-text">正在认真想一想…</p></div>
+                  <div class="message-content">
+                    <div class="message-role">{{ activeApp.name }}</div>
+                    <MarkdownMessage v-if="streamedAnswer" class="message-text" :content="streamedAnswer" />
+                    <p v-else class="message-text">{{ streamStage ? requestStatus : '正在等待回复…' }}</p>
+                  </div>
                 </article>
               </template>
             </div>
           </div>
 
           <div class="composer-area">
-            <p v-if="session.error" id="error-message" class="error-message" role="alert">{{ session.error }}</p>
+            <p v-if="session.error && activeAppId !== 'firstapp'" id="error-message" class="error-message" role="alert">{{ session.error }}</p>
             <div v-if="session.failedDraft" class="failed-draft" role="status">
               <p>已保留 {{ session.failedDraftCount }} 条发送失败的原文。当前草稿不会被覆盖。</p>
               <details><summary>查看待恢复原文</summary><p class="failed-draft-text">{{ session.failedDraft }}</p></details>

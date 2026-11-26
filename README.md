@@ -1,6 +1,6 @@
 # AI Agent Front
 
-从后端静态页面抽出的独立 Vue 3 + Vite 项目。当前下拉框只有已接入的 **LoveApp**，通过 `POST /api/ai/love/v1` 进行多轮对话。
+从后端静态页面抽出的独立 Vue 3 + Vite 项目。在聊天页的「当前应用」选择 **FirstApp**，可用完整回复或 SSE 连续对话。**LoveApp** 保留原有的完整回复入口。
 
 ## BaseChat Benchmark
 
@@ -43,7 +43,9 @@ cp .env.example .env.local
 - 原始 HTML 不执行；图片语法显示为文字说明，不自动请求模型输出的远程图片。代码块保留排版，暂未添加语法高亮和数学公式渲染。
 - 首轮只发送 `message`，接收后端返回的 `conversationId + answer`；后续请求自动带上同一个 ID。
 - 会话只保存在当前页面内存中。刷新或“新建会话”会清空页面记录，下次发送不带旧 ID；这不会删除后端旧会话的记忆。
-- LoveApp 的多轮聊天界面保留独立的回复方式设置。上面的三种回复方式用于 BaseChat Benchmark 单轮测试。
+- FirstApp 的完整回复请求发往 `POST /api/ai/first-app`，事件流请求发往 `POST /api/ai/first-app/event-stream`。事件流开始时从 `turn.started` 读取会话编号，两种回复方式共用该编号。
+- FirstApp 的完整回复和 `turn.started` 都携带服务端的到期时间 `expiresAt`。页面按这个时间标记过期会话，保留分隔线以上的消息，下次发送时开启新会话。若后端重启清空了内存，使用原 ID 续聊也可能得到一段空历史。
+- SSE 默认等待首个事件 150 秒，后续每收到有效事件就重新计算 150 秒的空闲时限。完整回复仍从点击发送起计时。
 
 ## 结构
 
@@ -62,7 +64,7 @@ tests/                           # 离线请求状态与渲染测试
 
 新增应用时先实现后端接口，再在 `APP_REGISTRY` 添加独立 `id`、`name`、`description`、`endpoint` 和 `suggestions`。默认共用 `{message, conversationId?} → {conversationId, answer}` 协议；不同协议先在请求层适配。状态按应用隔离，业务专属欢迎文案可以在 `App.vue` 中进一步组件化。
 
-若后续接入 LoveApp 多轮流式回复，需要先约定首轮会话 ID 的返回方式，再由 `useChat` 更新会话状态。
+接入同一 SSE 协议的应用可以在注册表配置 `eventStreamEndpoint`。
 
 ## 验证与打包
 

@@ -14,7 +14,12 @@ const abortedError = () => new ChatRequestError(
   'aborted', '已停止等待这次回复；这不代表服务器已取消处理。',
 );
 
-function httpError(status) {
+function expiredSessionError() {
+  return new ChatRequestError('session_expired', '上一段会话已失效，请开始新会话。');
+}
+
+function httpError(status, appId) {
+  if (status === 410 && appId === 'firstapp') return expiredSessionError();
   const messages = {
     400: '请求参数有误，请检查输入后再发送。',
     401: '请求未获授权，请检查后端访问权限或模型配置。',
@@ -36,12 +41,16 @@ export function validateChatResponse(data) {
     throw new ChatRequestError('invalid-response',
       '后端响应缺少有效的会话编号或回答，请检查聊天接口的响应格式。');
   }
-  return { conversationId: data.conversationId.trim(), answer: data.answer };
+  const result = { conversationId: data.conversationId.trim(), answer: data.answer };
+  if (typeof data.expiresAt === 'string' && Number.isFinite(Date.parse(data.expiresAt))) {
+    result.expiresAt = data.expiresAt;
+  }
+  return result;
 }
 
 export function sendCompleteRequest({ app, validateResponse = validateChatResponse, ...options }) {
   return postChat({
-    ...options, endpoint: app?.endpoint, accept: 'application/json',
+    ...options, appId: app?.id, endpoint: app?.endpoint, accept: 'application/json',
     async read(response) {
       let body;
       try {
@@ -105,8 +114,8 @@ function readEventData(data) {
 
 export function sendEventStreamRequest({ app, onText, onStage, ...options }) {
   return postChat({
-    ...options, endpoint: app.eventStreamEndpoint, accept: 'text/event-stream',
-    async read(response, signal) {
+    ...options, appId: app.id, endpoint: app.eventStreamEndpoint, accept: 'text/event-stream',
+    async read(response, signal, restartIdleTimer) {
       const type = response.headers.get('content-type')?.split(';')[0].trim().toLowerCase();
       if (type !== 'text/event-stream' || !response.body) {
         throw new ChatRequestError('invalid-response', '后端未返回 SSE 事件流，请检查事件流接口。');
@@ -115,8 +124,11 @@ export function sendEventStreamRequest({ app, onText, onStage, ...options }) {
         .pipeThrough(new TextDecoderStream(), { signal })
         .pipeThrough(new EventSourceParserStream());
       for await (const { event, data } of events) {
+        if (signal.aborted) throw abortedError();
+        // Count a complete SSE event as progress, including future event types.
+        restartIdleTimer();
         if (event === 'turn.started' || event === 'generation.started') {
-          onStage(event);
+          onStage?.(event, readEventData(data));
         } else if (event === 'answer.delta') {
           const text = readEventData(data)?.text;
           if (typeof text !== 'string') {
@@ -124,10 +136,13 @@ export function sendEventStreamRequest({ app, onText, onStage, ...options }) {
           }
           onText(text);
         } else if (event === 'turn.finished') {
-          const status = readEventData(data)?.status;
+          const { status, error } = readEventData(data) ?? {};
           if (status === 'completed') return;
           if (status === 'failed') {
-            throw new ChatRequestError('generation-failed', '后端报告本轮生成失败。');
+            if (error?.code === 'session_expired') throw expiredSessionError();
+            const message = typeof error?.code === 'string' && error.code.trim()
+              && typeof error.message === 'string' ? error.message.trim() : '';
+            throw new ChatRequestError('generation-failed', message || '后端报告本轮生成失败。');
           }
           throw new ChatRequestError('invalid-response', 'turn.finished 返回了无效的结束状态。');
         }
@@ -139,8 +154,8 @@ export function sendEventStreamRequest({ app, onText, onStage, ...options }) {
 
 // A retry can submit the same prompt twice.
 async function postChat({
-  endpoint, accept, read, message, conversationId = null, fetchImpl = globalThis.fetch,
-  timeoutMs = DEFAULT_TIMEOUT_MS, signal,
+  endpoint, appId, accept, read, message, conversationId = null, fetchImpl = globalThis.fetch,
+  timeoutMs = DEFAULT_TIMEOUT_MS, idleTimeoutMs = timeoutMs, signal,
 }) {
   if (typeof message !== 'string' || !message.trim()) {
     throw new ChatRequestError('empty-message', '请先输入消息。');
@@ -169,8 +184,15 @@ async function postChat({
   };
   const onAbort = () => stopWaiting(abortedError());
   signal?.addEventListener('abort', onAbort, { once: true });
-  const timeout = setTimeout(() => stopWaiting(new ChatRequestError('timeout',
-    '等待回复超时，服务器可能仍在处理这次请求。请稍后检查，再决定是否重新发送。')), timeoutMs);
+  let timeout;
+  const startTimer = (duration, description) => {
+    clearTimeout(timeout);
+    timeout = setTimeout(() => stopWaiting(new ChatRequestError('timeout', description)), duration);
+  };
+  startTimer(timeoutMs, accept === 'text/event-stream'
+    ? '等待首个事件超时，服务器可能仍在处理这次请求。'
+    : '等待回复超时，服务器可能仍在处理这次请求。请稍后检查，再决定是否重新发送。');
+  const restartIdleTimer = () => startTimer(idleTimeoutMs, '等待下一个事件超时，服务器可能仍在处理这次请求。');
 
   const request = async () => {
     const response = await fetchImpl(endpoint, {
@@ -181,9 +203,9 @@ async function postChat({
       signal: controller.signal,
     });
     // Do not read or show an error page, raw exception or other server internals.
-    if (!response.ok) throw httpError(response.status);
+    if (!response.ok) throw httpError(response.status, appId);
     if (stopReason) throw stopReason;
-    return read(response, controller.signal);
+    return read(response, controller.signal, restartIdleTimer);
   };
 
   try {

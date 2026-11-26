@@ -25,7 +25,7 @@ export default defineConfig(({ mode }) => {
         },
         preview: {
             host: 'localhost', port: 4173, strictPort: true,
-            proxy: { ...docsProxy, '^/api/ai/benchmark(?:-stream|-event-stream)?(?:\\?|$)': apiProxy, '/api': upstream },
+            proxy: { ...docsProxy, '/api/ai/first-app': apiProxy, '^/api/ai/benchmark(?:-stream|-event-stream)?(?:\\?|$)': apiProxy, '/api': upstream },
         },
         test: { environment: 'jsdom', clearMocks: true, restoreMocks: true }
     };
